@@ -80,6 +80,7 @@ class NpyDataset(Dataset):
         img_1024 = np.load(
             join(self.img_path, img_name), "r", allow_pickle=True
         )  # (1024, 1024, 3)
+        img_1024 = transform.resize(img_1024, (1024, 1024, 3))
         # convert the shape to (3, H, W)
         img_1024 = np.transpose(img_1024, (2, 0, 1))
         assert (
@@ -91,6 +92,7 @@ class NpyDataset(Dataset):
         assert img_name == os.path.basename(self.gt_path_files[index]), (
             "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
         )
+        gt = transform.resize(gt, (1024, 1024), order=0)
         label_ids = np.unique(gt)[1:]
         gt2D = np.uint8(
             gt == random.choice(label_ids.tolist())
@@ -115,7 +117,7 @@ class NpyDataset(Dataset):
 
 
 # %% sanity test of dataset class
-tr_dataset = NpyDataset("data/npy/CT_Abd")
+tr_dataset = NpyDataset("e:/PerkLab/UltrasoundSegmentation/Breast/medsam/train")
 tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
 for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
     print(image.shape, gt.shape, bboxes.shape)
