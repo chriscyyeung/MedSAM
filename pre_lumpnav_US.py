@@ -26,9 +26,19 @@ def parse_args():
         "--patient-ids", 
         nargs="*", 
         default="all",
-        help="List of patient IDs to process. Default: all."
+        help="List of patient IDs to process. Default: use all."
     )
-    parser.add_argument("--img-size", type=int, default=468)
+    parser.add_argument(
+        "--crop-size", 
+        type=int,
+        help="Crop size of input images (square). Omit to keep original size."
+    )
+    parser.add_argument(
+        "--img-size", 
+        type=int,
+        default=224, 
+        help="Resize images to square of this size. Default: 224."
+    )
     parser.add_argument(
         "--log-empty-gt", 
         action="store_true",
@@ -73,22 +83,26 @@ def main(args):
         img_id = f"{patient_id}_{img_num}"
 
         gt = cv2.imread(gt_fn, cv2.IMREAD_GRAYSCALE)
-        if np.max(gt) > 1:
-            gt = gt / 255  # convert to binary
         if np.max(gt) == 0:
             if args.log_empty_gt:
                 empty_gt_ids.append(img_id)
             continue  # skip empty ground truth
-        assert np.max(gt) == 1 and np.min(gt) == 0, "Ground truth must be 0, 1."
         gt = np.flip(gt, axis=0)
-        gt = crop(gt, args.img_size)
+        if args.img_size:
+            gt = crop(gt, args.crop_size)
+        gt = cv2.resize(gt, (args.img_size, args.img_size), interpolation=cv2.INTER_NEAREST)
+        if np.max(gt) > 1:
+            gt = gt // 255  # convert to binary
+        assert np.max(gt) == 1 and np.min(gt) == 0, "Ground truth must be 0, 1."
 
         img = cv2.imread(img_fn)  # (H, W, 3)
+        img = np.flip(img, axis=0)
+        if args.img_size:
+            img = crop(img, args.crop_size)
+        img = cv2.resize(img, (args.img_size, args.img_size), interpolation=cv2.INTER_CUBIC)
         if 1 < np.max(img) <= 255:
             img = img / 255  # normalize to [0, 1]
         assert np.max(img) <= 1.0 and np.min(img) >= 0.0, "Image must be in [0, 1]."
-        img = np.flip(img, axis=0)
-        img = crop(img, args.img_size)
 
         new_img_path = os.path.join(imgs_path, img_id + ".npy")
         new_gt_path = os.path.join(gts_path, img_id + ".npy")
