@@ -1,3 +1,5 @@
+"""Preprocessing script for ultrasound images collected from NaviKnife."""
+
 import os
 import glob
 import argparse
