@@ -1,8 +1,12 @@
 # MedSAM
 This is the official repository for MedSAM: Segment Anything in Medical Images.
 
+Welcome to join our [mailing list](https://forms.gle/hk4Efp6uWnhjUHFP6) to get updates.
+
+
 ## News
 
+- 2024.08.06: Med[SAM2](https://github.com/facebookresearch/segment-anything-2)-Segment Anything in Medical Images and Videos: Benchmark and Deployment [[`Paper`](https://arxiv.org/abs/2408.03322)] [[`Code`](https://github.com/bowang-lab/MedSAM/tree/MedSAM2)] [[Online Demo](https://huggingface.co/spaces/junma/MedSAM2)] [[`Gradio API`](https://github.com/bowang-lab/MedSAM/blob/MedSAM2/app.py)] [[`3D Slicer Plugin`](https://github.com/bowang-lab/MedSAMSlicer/tree/SAM2)] [[Fine-tune SAM2](https://github.com/bowang-lab/MedSAM/tree/MedSAM2?tab=readme-ov-file#fine-tune-sam2-on-the-abdomen-ct-dataset)]
 - 2024.01.15: Welcome to join [CVPR 2024 Challenge: MedSAM on Laptop](https://www.codabench.org/competitions/1847/)
 - 2024.01.15: Release [LiteMedSAM](https://github.com/bowang-lab/MedSAM/blob/LiteMedSAM/README.md) and [3D Slicer Plugin](https://github.com/bowang-lab/MedSAMSlicer), 10x faster than MedSAM! 
 
@@ -77,7 +81,7 @@ python pre_CT_MR.py
 - split dataset: 80% for training and 20% for testing
 - adjust CT scans to [soft tissue](https://radiopaedia.org/articles/windowing-ct) window level (40) and width (400)
 - max-min normalization
-- resample image size to `1024x2014`
+- resample image size to `1024x1024`
 - save the pre-processed images and labels as `npy` files
 
 
@@ -101,7 +105,6 @@ python utils/ckpt_convert.py # Please set the corresponding checkpoint path firs
 python train_one_gpu.py
 ```
 
-If you only want to train the mask decoder, please check the tutorial on the [0.1 branch](https://github.com/bowang-lab/MedSAM/tree/0.1).
 
 
 ## Acknowledgements
@@ -118,7 +121,7 @@ If you only want to train the mask decoder, please check the tutorial on the [0.
   author={Ma, Jun and He, Yuting and Li, Feifei and Han, Lin and You, Chenyu and Wang, Bo},
   journal={Nature Communications},
   volume={15},
-  pages={1--9},
+  pages={654},
   year={2024}
 }
 ```
