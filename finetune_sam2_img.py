@@ -67,19 +67,48 @@ def show_box(box, ax):
 class NpyDataset(Dataset):
     def __init__(self, data_root, bbox_shift=20):
         self.data_root = data_root
-        self.gt_path = join(data_root, "gts")
-        self.img_path = join(data_root, "imgs")
+        self.gt_path = join(data_root, "labels")
+        self.img_path = join(data_root, "images")
         self.gt_path_files = sorted(
-            glob.glob(join(self.gt_path, "*.npy"), recursive=True)
+            glob.glob(join(self.gt_path, "*/*.npy"), recursive=True)
         )
         self.gt_path_files = self.gt_path_files
         self.gt_path_files = [
-            file
+            os.path.relpath(file, self.gt_path)
             for file in self.gt_path_files
-            if os.path.isfile(join(self.img_path, os.path.basename(file)))
+            if os.path.isfile(join(
+                self.img_path, 
+                os.path.relpath(file, self.gt_path).replace("segmentation", "ultrasound")))
         ]
         self.bbox_shift = bbox_shift
-        self._transform = SAM2Transforms(resolution=1024, mask_threshold=0)
+        # self._transform = SAM2Transforms(resolution=1024, mask_threshold=0)
+        self.mean = [0.485, 0.456, 0.406]
+        self.std = [0.229, 0.224, 0.225]
+
+        # preprocessing transforms
+        transforms = []
+        transforms.append(monai.transforms.Transposed(keys=["img", "gt"], indices=(2, 0, 1)))
+        transforms.append(monai.transforms.ToTensord(keys=["img", "gt"]))
+        transforms.append(monai.transforms.EnsureTyped(keys=["img", "gt"], dtype="float32"))
+        transforms.append(monai.transforms.Resized(keys=["img", "gt"], spatial_size=(1024, 1024)))
+        transforms.append(monai.transforms.NormalizeIntensityd(keys=["img"], subtrahend=self.mean, divisor=self.std, channel_wise=True))
+        
+        # data augmentation transforms
+        transforms.append(monai.transforms.RandGaussianNoised(keys=["img"]))
+        transforms.append(monai.transforms.RandFlipd(keys=["img", "gt"], prob=0.5, spatial_axis=1))
+        transforms.append(monai.transforms.RandAdjustContrastd(keys=["img"], prob=0.5, gamma=[0.7, 1.2]))
+        transforms.append(monai.transforms.RandAffined(
+            keys=["img", "gt"], 
+            prob=0.8, 
+            rotate_range=[-0.2, 0.2], 
+            shear_range=[-0.1, 0.1], 
+            translate_range=[-128, 128], 
+            scale_range=[-0.1, 0.1], 
+            padding_mode="zeros"
+        ))
+
+        self._transform = monai.transforms.Compose(transforms)
+
         print(f"number of images: {len(self.gt_path_files)}")
 
 
@@ -88,35 +117,54 @@ class NpyDataset(Dataset):
 
     def __getitem__(self, index):
         # load npy image (1024, 1024, 3), [0,1]
-        img_name = os.path.basename(self.gt_path_files[index])
+        img_name = self.gt_path_files[index].replace("segmentation", "ultrasound")
         img = np.load(
             join(self.img_path, img_name), "r", allow_pickle=True
-        )  # (1024, 1024, 3)
+        )  # (1024, 1024, 3) /// (128, 128, 3)
+        # take first frame and repeat 3 times
+        img = np.repeat(img[..., 0][..., np.newaxis], 3, axis=2)  # (128, 128, 3)
+        img = img / 255.0  # scale to [0, 1]
         # convert the shape to (3, H, W)
-        img_1024 = self._transform(img.copy())
+        # img_1024 = self._transform(img.copy())
         gt = np.load(
-            self.gt_path_files[index], "r", allow_pickle=True
-        )  # multiple labels [0, 1,4,5...], (256,256)
-        assert img_name == os.path.basename(self.gt_path_files[index]), (
-            "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
-        )
-        assert gt.shape == (256, 256), "ground truth should be 256x256"
-        label_ids = np.unique(gt)[1:]
-        gt2D = np.uint8(
-            gt == random.choice(label_ids.tolist())
-        )  # only one label, (256, 256)
-        assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
-        y_indices, x_indices = np.where(gt2D > 0)
-        x_min, x_max = np.min(x_indices), np.max(x_indices)
-        y_min, y_max = np.min(y_indices), np.max(y_indices)
-        # add perturbation to bounding box coordinates
+            join(self.gt_path, self.gt_path_files[index]), "r", allow_pickle=True
+        )  # multiple labels [0, 1,4,5...], (256,256) /// (128, 128, 1)
+        # call transforms here
+        data = {"img": img, "gt": gt}
+        data = self._transform(data)
+        img_1024 = data["img"]
+        gt = data["gt"]
+        gt = gt[0, ...]
+        gt2D = cv2.resize(gt.numpy(), (256, 256), interpolation=cv2.INTER_NEAREST)
         H, W = gt2D.shape
-        x_min = max(0, x_min - random.randint(0, self.bbox_shift))
-        x_max = min(W, x_max + random.randint(0, self.bbox_shift))
-        y_min = max(0, y_min - random.randint(0, self.bbox_shift))
-        y_max = min(H, y_max + random.randint(0, self.bbox_shift))
+        # assert img_name == os.path.basename(self.gt_path_files[index]), (
+        #     "img gt name error" + self.gt_path_files[index] + self.npy_files[index]
+        # )
+        # assert gt.shape == (256, 256), "ground truth should be 256x256"
+        # label_ids = np.unique(gt)[1:]
+        # gt2D = np.uint8(
+        #     gt == random.choice(label_ids.tolist())
+        # )  # only one label, (256, 256)
+        # assert np.max(gt2D) == 1 and np.min(gt2D) == 0.0, "ground truth should be 0, 1"
+        # y_indices, x_indices = np.where(gt2D > 0)
+        # x_min, x_max = np.min(x_indices), np.max(x_indices)
+        # y_min, y_max = np.min(y_indices), np.max(y_indices)
+        # add perturbation to bounding box coordinates
+        # x_min = max(0, x_min - random.randint(0, self.bbox_shift))
+        # x_max = min(W, x_max + random.randint(0, self.bbox_shift))
+        # y_min = max(0, y_min - random.randint(0, self.bbox_shift))
+        # y_max = min(H, y_max + random.randint(0, self.bbox_shift))
+
+        # generate random bounding box coordinates (act as no prompt)
+        box_width = np.random.randint(10, W // 2)
+        box_height = np.random.randint(10, H // 2)
+        x_min = np.random.randint(0, W - box_width)
+        y_min = np.random.randint(0, H - box_height)
+        x_max = x_min + box_width
+        y_max = y_min + box_height
 
         bboxes = np.array([x_min, y_min, x_max, y_max])*4 ## scale bbox from 256 to 1024
+        # bboxes = np.array([x_min, y_min, x_max, y_max])
 
         return (
             img_1024, ## [3, 1024, 1024]
@@ -173,8 +221,8 @@ images, gts, bboxes, names_temp = next(iter(tr_dataloader))
 idx = random.randint(0, images.shape[0]-1)
 inv_sam2_transform = torchvision.transforms.Compose(
     [
-        torchvision.transforms.Normalize(mean=[0, 0, 0], std=[1 / i for i in tr_dataset._transform.std]),
-        torchvision.transforms.Normalize(mean=[-1 * i for i in tr_dataset._transform.mean], std=[1, 1, 1]),
+        torchvision.transforms.Normalize(mean=[0, 0, 0], std=[1 / i for i in tr_dataset.std]),
+        torchvision.transforms.Normalize(mean=[-1 * i for i in tr_dataset.mean], std=[1, 1, 1]),
     ]
 )
 _, axs = plt.subplots(1, 2, figsize=(25, 25))
@@ -189,6 +237,13 @@ show_mask(
     ),
     axs[0]
 )
+# data = {"img": images[idx], "gt": gts[idx].squeeze(0)}
+# data = tr_dataset._transform.inverse(data)
+# axs[0].imshow(data["img"])
+# show_mask(
+#     data["gt"],
+#     axs[0]
+# )
 show_box(bboxes[idx].numpy(), axs[0])
 axs[0].axis("off")
 axs[0].set_title(names_temp[idx])
@@ -204,6 +259,10 @@ show_mask(
     ),
     axs[1]
 )
+# show_mask(
+#     gts[idx].clone().squeeze(0).numpy(),
+#     axs[1]
+# )
 show_box(bboxes[idx].numpy(), axs[1])
 axs[1].axis("off")
 axs[1].set_title(names_temp[idx])
@@ -245,6 +304,7 @@ class MedSAM2(nn.Module):
 
             sparse_embeddings, dense_embeddings = self.sam2_model.sam_prompt_encoder(
                 points=concat_points,
+                # points=None, 
                 boxes=None,
                 masks=None,
             )

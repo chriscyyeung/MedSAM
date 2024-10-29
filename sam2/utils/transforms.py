@@ -4,10 +4,19 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.transforms import Normalize, Resize, ToTensor
+from torchvision.transforms import (
+    InterpolationMode, 
+    Normalize, 
+    Resize, 
+    ToTensor,
+    RandomHorizontalFlip, 
+    RandomAffine, 
+    ColorJitter
+)
 
 
 class SAM2Transforms(nn.Module):
@@ -29,11 +38,21 @@ class SAM2Transforms(nn.Module):
             nn.Sequential(
                 Resize((self.resolution, self.resolution)),
                 Normalize(self.mean, self.std),
+                # RandomHorizontalFlip(),
+                # RandomAffine(
+                #     degrees=30, 
+                #     shear=15, 
+                #     translate=(0.1, 0.1), 
+                #     scale=(0.9, 1.1), 
+                #     interpolation=InterpolationMode.BILINEAR
+                # ),
+                # ColorJitter(brightness=0.1, contrast=0.05)
             )
         )
 
     def __call__(self, x):
         x = self.to_tensor(x)
+        print(np.min(x.numpy()), np.max(x.numpy()))
         return self.transforms(x)
 
     def forward_batch(self, img_list):
