@@ -23,6 +23,20 @@ import random
 from datetime import datetime
 import shutil
 import glob
+from sklearn.model_selection import KFold
+
+from monai.data.utils import decollate_batch
+from monai.metrics import (
+    DiceMetric, 
+    MeanIoU, 
+    HausdorffDistanceMetric, 
+    ConfusionMatrixMetric
+)
+from monai.transforms import (
+    Compose,
+    Activations,
+    AsDiscrete
+)
 
 # set seeds
 torch.manual_seed(2023)
@@ -35,6 +49,146 @@ os.environ["OPENBLAS_NUM_THREADS"] = "4"  # export OPENBLAS_NUM_THREADS=4
 os.environ["MKL_NUM_THREADS"] = "6"  # export MKL_NUM_THREADS=6
 os.environ["VECLIB_MAXIMUM_THREADS"] = "4"  # export VECLIB_MAXIMUM_THREADS=4
 os.environ["NUMEXPR_NUM_THREADS"] = "6"  # export NUMEXPR_NUM_THREADS=6
+
+
+def get_dataloaders(root_dir, fold=0, k_folds=5, num_workers=4, batch_size=2, use_mmap=True):
+    """
+    Create train/val/test dataloaders using k-fold patient-level splitting.
+
+    Args:
+        config (dict): Loaded YAML config.
+            Must contain:
+                - root_dir: path to dataset
+                - batch_size: int
+                - num_workers (optional)
+                - transforms: dict containing 'general' and 'train'
+                - folds (optional): number of folds for cross-validation
+                - use_mmap (optional, default=True)
+        fold (int): The index of the current fold (0 <= fold < folds)
+
+    Returns:
+        (train_loader, val_loader, test_loader)
+    """
+    # --- Discover patients ---
+    all_files = glob.glob(os.path.join(root_dir, "LN*_ultrasound.npy"))
+    all_patients = sorted([os.path.basename(f).split("_")[0] for f in all_files])
+    if len(all_patients) < k_folds:
+        raise ValueError(f"Not enough patients ({len(all_patients)}) for {k_folds}-fold CV.")
+
+    # --- Create folds ---
+    kf = KFold(n_splits=k_folds, shuffle=True, random_state=42)
+    all_folds = list(kf.split(all_patients))
+
+    train_idx, val_idx = all_folds[fold]
+    train_patients = [all_patients[i] for i in train_idx]
+    val_patients = [all_patients[i] for i in val_idx]
+
+    # Optional test split: use validation patients for test as well
+    # or implement a separate hold-out test set
+    # test_patients = val_patients
+
+    print(f"Fold {fold+1}/{k_folds}: Train {len(train_patients)}, Val {len(val_patients)}")
+
+    # --- Create datasets ---
+    train_dataset = LumpNav3DNpyDataset(
+        root_dir=root_dir,
+        patients=train_patients,
+        use_mmap=use_mmap,
+    )
+    val_dataset = LumpNav3DNpyDataset(
+        root_dir=root_dir,
+        patients=val_patients,
+        use_mmap=use_mmap,
+    )
+
+    # --- Dataloaders ---
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers
+    )
+    return train_loader, val_loader
+
+
+class LumpNav3DNpyDataset(Dataset):
+    def __init__(self, root_dir, patients=None, bbox_shift=20, use_mmap=True):
+        """
+        Args:
+            root_dir (str): Folder containing all .npy files.
+            patients (list, optional): List of patient IDs to include. If None, include all.
+            transform (callable, optional): Transform to apply to each sample.
+            use_mmap (bool): Whether to use memory-mapped loading (saves RAM for large datasets).
+        """
+        self.root_dir = root_dir
+        self.use_mmap = use_mmap
+        self.bbox_shift = bbox_shift
+
+        # Group files by patient
+        self.patients = {}
+        for file in glob.glob(os.path.join(root_dir, "LN*_*.npy")):
+            basename = os.path.basename(file)
+            pid, imgtype = basename.split("_")
+            imgtype = imgtype.replace(".npy", "")
+            if pid not in self.patients:
+                self.patients[pid] = {}
+            self.patients[pid][imgtype] = file
+
+        # Optionally filter by provided patient list
+        if patients is not None:
+            self.patients = {pid: self.patients[pid] for pid in patients if pid in self.patients}
+
+        # Build frame index for all selected patients
+        self.index = []
+        for pid, files in self.patients.items():
+            us = np.load(files["ultrasound"], mmap_mode="r" if use_mmap else None)
+            num_frames = us.shape[0]
+            for f in range(num_frames):
+                self.index.append((pid, f))
+
+    def __len__(self):
+        return len(self.index)
+
+    def __getitem__(self, idx):
+        pid, frame_idx = self.index[idx]
+        files = self.patients[pid]
+
+        mmap_mode = "r" if self.use_mmap else None
+        us = np.load(files["ultrasound"], mmap_mode=mmap_mode)[frame_idx]  # [H, W, 1]
+        us = np.repeat(us, 3, axis=2)  # [H, W, 3] expand to 3 channels
+        us = transform.resize(us, (1024, 1024, 3))   # resize to 1024x1024
+        us = np.transpose(us, (2, 0, 1))  # [3, 1024, 1024]
+
+        seg = np.load(files["segmentation"], mmap_mode=mmap_mode)[frame_idx][:, :, 0]  # [H, W]
+        seg = transform.resize(seg, (1024, 1024), order=0)  # resize to 1024x1024
+
+        # check if seg is empty
+        if np.sum(seg) == 0:
+            # create random bbox
+            H, W = seg.shape
+            x_min = random.randint(0, W - 100)
+            x_max = min(W, x_min + random.randint(50, 100))
+            y_min = random.randint(0, H - 100)
+            y_max = min(H, y_min + random.randint(50, 100))
+            bboxes = np.array([x_min, y_min, x_max, y_max])
+        else:
+            y_indices, x_indices = np.where(seg > 0)
+            x_min, x_max = np.min(x_indices), np.max(x_indices)
+            y_min, y_max = np.min(y_indices), np.max(y_indices)
+            # add perturbation to bounding box coordinates
+            H, W = seg.shape
+            x_min = max(0, x_min - random.randint(0, self.bbox_shift))
+            x_max = min(W, x_max + random.randint(0, self.bbox_shift))
+            y_min = max(0, y_min - random.randint(0, self.bbox_shift))
+            y_max = min(H, y_max + random.randint(0, self.bbox_shift))
+            bboxes = np.array([x_min, y_min, x_max, y_max])
+
+        return (
+            torch.tensor(us).float(),
+            torch.tensor(seg[None, :, :]).float(),
+            torch.tensor(bboxes).float(),
+            f"{pid}_{frame_idx:04d}",
+        )
 
 
 def show_mask(mask, ax, random_color=False):
@@ -117,7 +271,8 @@ class NpyDataset(Dataset):
 
 
 # %% sanity test of dataset class
-tr_dataset = NpyDataset("e:/PerkLab/UltrasoundSegmentation/Breast/medsam/train")
+# tr_dataset = NpyDataset("e:/PerkLab/UltrasoundSegmentation/Breast/medsam/train")
+tr_dataset = LumpNav3DNpyDataset("/home/cyeung/projects/aip-medilab/cyeung/tracked-us-segmentation/data/LumpNavPatientArrays")
 tr_dataloader = DataLoader(tr_dataset, batch_size=8, shuffle=True)
 for step, (image, gt, bboxes, names_temp) in enumerate(tr_dataloader):
     print(image.shape, gt.shape, bboxes.shape)
@@ -164,6 +319,7 @@ parser.add_argument(
 parser.add_argument("-pretrain_model_path", type=str, default="")
 parser.add_argument("-work_dir", type=str, default="./work_dir")
 # train
+parser.add_argument("-fold", type=int, default=0)
 parser.add_argument("-num_epochs", type=int, default=1000)
 parser.add_argument("-batch_size", type=int, default=2)
 parser.add_argument("-num_workers", type=int, default=0)
@@ -177,6 +333,7 @@ parser.add_argument(
 parser.add_argument(
     "-use_wandb", type=bool, default=False, help="use wandb to monitor training"
 )
+parser.add_argument("-wandb_project_name", type=str, default="breast-tracked-us")
 parser.add_argument("-use_amp", action="store_true", default=False, help="use amp")
 parser.add_argument(
     "--resume", type=str, default="", help="Resuming training from checkpoint"
@@ -184,12 +341,21 @@ parser.add_argument(
 parser.add_argument("--device", type=str, default="cuda:0")
 args = parser.parse_args()
 
+
+run_id = datetime.now().strftime("%Y%m%d-%H%M")
+if args.fold is not None:
+    model_save_path = join(args.work_dir, args.task_name, f"fold{args.fold}-{run_id}")
+else:
+    model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
+
 if args.use_wandb:
     import wandb
 
     wandb.login()
     wandb.init(
-        project=args.task_name,
+        project=args.wandb_project_name,
+        name=f"{args.task_name}-fold{args.fold}_{run_id}" \
+            if args.fold is not None else f"{args.task_name}_{run_id}",
         config={
             "lr": args.lr,
             "batch_size": args.batch_size,
@@ -198,13 +364,8 @@ if args.use_wandb:
         },
     )
 
-# %% set up model for training
-# device = args.device
-run_id = datetime.now().strftime("%Y%m%d-%H%M")
-model_save_path = join(args.work_dir, args.task_name + "-" + run_id)
-device = torch.device(args.device)
 # %% set up model
-
+device = torch.device(args.device)
 
 class MedSAM(nn.Module):
     def __init__(
@@ -291,16 +452,38 @@ def main():
     iter_num = 0
     losses = []
     best_loss = 1e10
-    train_dataset = NpyDataset(args.tr_npy_path)
+    # train_dataset = NpyDataset(args.tr_npy_path)
+    train_dataloader, val_dataloader = get_dataloaders(
+        args.tr_npy_path,
+        fold=args.fold,
+        num_workers=args.num_workers,
+        batch_size=args.batch_size,
+        use_mmap=True,
+        k_folds=5,
+    )
+    train_dataset = train_dataloader.dataset
+    val_dataset = val_dataloader.dataset
 
     print("Number of training samples: ", len(train_dataset))
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
+    print("Number of validation samples: ", len(val_dataset))
+    # train_dataloader = DataLoader(
+    #     train_dataset,
+    #     batch_size=args.batch_size,
+    #     shuffle=True,
+    #     num_workers=args.num_workers,
+    #     pin_memory=True,
+    # )
+
+    # metrics
+    dice_metric = DiceMetric(include_background=True, reduction="mean")
+    iou_metric = MeanIoU(include_background=True, reduction="mean")
+    hd95_metric = HausdorffDistanceMetric(include_background=True, percentile=95.0, reduction="mean")
+    confusion_matrix_metric = ConfusionMatrixMetric(
+        include_background=True,
+        metric_name=["accuracy", "precision", "sensitivity", "specificity", "f1_score"],
+        reduction="mean"
     )
+    post_pred = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
 
     start_epoch = 0
     if args.resume is not None:
@@ -315,6 +498,7 @@ def main():
 
     for epoch in range(start_epoch, num_epochs):
         epoch_loss = 0
+        medsam_model.train()
         for step, (image, gt2D, boxes, _) in enumerate(tqdm(train_dataloader)):
             optimizer.zero_grad()
             boxes_np = boxes.detach().cpu().numpy()
@@ -342,11 +526,78 @@ def main():
 
         epoch_loss /= step
         losses.append(epoch_loss)
-        if args.use_wandb:
-            wandb.log({"epoch_loss": epoch_loss})
         print(
             f'Time: {datetime.now().strftime("%Y%m%d-%H%M")}, Epoch: {epoch}, Loss: {epoch_loss}'
         )
+
+        # validation
+        medsam_model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for step, (image, gt2D, boxes, _) in enumerate(tqdm(val_dataloader)):
+                boxes_np = boxes.detach().cpu().numpy()
+                image, gt2D = image.to(device), gt2D.to(device)
+                medsam_pred = medsam_model(image, boxes_np)
+                loss = seg_loss(medsam_pred, gt2D) + ce_loss(medsam_pred, gt2D.float())
+                val_loss += loss.item()
+
+                medsam_pred = [post_pred(i) for i in decollate_batch(medsam_pred)]
+                gt2D = decollate_batch(gt2D)
+                dice_metric(y_pred=medsam_pred, y=gt2D)
+                iou_metric(y_pred=medsam_pred, y=gt2D)
+                hd95_metric(y_pred=medsam_pred, y=gt2D)
+                confusion_matrix_metric(y_pred=medsam_pred, y=gt2D)
+            
+            val_loss /= step
+            dice = dice_metric.aggregate().item()
+            iou = iou_metric.aggregate().item()
+            hd95 = hd95_metric.aggregate().item()
+            cm = confusion_matrix_metric.aggregate()
+
+            dice_metric.reset()
+            iou_metric.reset()
+            hd95_metric.reset()
+            confusion_matrix_metric.reset()
+
+        # log image
+        random.seed(42)
+        sample = random.sample(range(len(val_dataset)), 5)
+        inputs = torch.stack([val_dataset[i][0] for i in sample]).to(device)
+        gts = torch.stack([val_dataset[i][1] for i in sample]).to(device)
+        boxes = torch.stack([val_dataset[i][2] for i in sample]).to(device)
+        boxes_np = boxes.detach().cpu().numpy()
+        with torch.no_grad():
+            preds = medsam_model(inputs, boxes_np)
+        
+        fig, axes = plt.subplots(5, 3, figsize=(9, 3 * 5))
+        for i in range(5):
+            axes[i, 0].imshow(inputs[i, 0, :, :].detach().cpu(), cmap="gray")
+            axes[i, 1].imshow(gts[i].squeeze().detach().cpu(), cmap="gray")
+            im = axes[i, 2].imshow(torch.sigmoid(preds[i]).squeeze().detach().cpu(), cmap="gray")
+
+            # Create an additional axis for the colorbar
+            cax = fig.add_axes([axes[i, 2].get_position().x1 + 0.01,
+                                axes[i, 2].get_position().y0,
+                                0.02,
+                                axes[i, 2].get_position().height])
+            fig.colorbar(im, cax=cax)
+
+        if args.use_wandb:
+            wandb.log({
+                "train_loss": epoch_loss,
+                "val_loss": val_loss,
+                "dice": dice,
+                "iou": iou,
+                "95hd": hd95,
+                "accuracy": cm[0].item(),
+                "precision": cm[1].item(),
+                "sensitivity": cm[2].item(),
+                "specificity": cm[3].item(),
+                "f1_score": cm[4].item(), 
+                "examples": wandb.Image(fig)
+            })
+        plt.close()
+
         ## save the latest model
         checkpoint = {
             "model": medsam_model.state_dict(),
